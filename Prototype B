@@ -1,0 +1,832 @@
+let centerRing;
+let magneticParticles = [];
+const PI = Math.PI;
+const TWO_PI = Math.PI * 2;
+
+// 音调相关变量
+let osc; // 振荡器
+let envelope; // 包络
+let notes = []; // 音调定义
+let octaveOffset = 0; // 八度偏移量（0=正常，-1=降八度，+1=升八度）
+let modifierKeys = { m: false, n: false }; // 修饰键状态
+
+// Arduino压力传感器相关变量
+let pressureValue = 0; // 压力传感器值 (0-700)
+let lastNoteTime = 0; // 上次触发音阶的时间
+let noteCooldown = 500; // 音阶触发冷却时间 (毫秒)
+let pressureThresholds = []; // 压力分层阈值
+
+// 角度差计算函数
+function angleDiff(a, b) {
+  let diff = (b - a + PI) % TWO_PI - PI;
+  return diff < -PI ? diff + TWO_PI : diff;
+}
+
+// 初始化音调
+function initSounds() {
+  // 定义基本音阶（C4-D5）
+  notes = [
+    { baseFreq: 261.63, name: "C4" }, // 1 - Do
+    { baseFreq: 293.66, name: "D4" }, // 2 - Re
+    { baseFreq: 329.63, name: "E4" }, // 3 - Mi
+    { baseFreq: 349.23, name: "F4" }, // 4 - Fa
+    { baseFreq: 392.00, name: "G4" }, // 5 - Sol
+    { baseFreq: 440.00, name: "A4" }, // 6 - La
+    { baseFreq: 493.88, name: "B4" }, // 7 - Si
+    { baseFreq: 523.25, name: "C5" }, // 8 - Do
+    { baseFreq: 587.33, name: "D5" }  // 9 - Re
+  ];
+  
+  // 创建振荡器和包络
+  osc = new p5.Oscillator('sine');
+  envelope = new p5.Envelope();
+  envelope.setADSR(0.01, 0.1, 0.5, 0.5); // 攻击,衰减,持续,释放
+  envelope.setRange(0.8, 0);
+  
+  osc.amp(envelope);
+  osc.start();
+}
+
+// 初始化压力传感器阈值
+function initPressureThresholds() {
+  // 将0-700范围分成9个等分，对应9个音阶
+  pressureThresholds = [];
+  let step = 700 / 9;
+  for (let i = 0; i < 9; i++) {
+    // 修复：将映射关系反过来
+    // 原来：压力0-77.78对应音阶0，压力622.22-700对应音阶8
+    // 现在：压力0-77.78对应音阶8，压力622.22-700对应音阶0
+    pressureThresholds.push({
+      min: i * step,
+      max: (i + 1) * step,
+      noteIndex: 8 - i  // 将音阶索引反过来
+    });
+  }
+}
+
+// 根据压力值获取对应的音阶
+function getNoteFromPressure(pressure) {
+  for (let i = 0; i < pressureThresholds.length; i++) {
+    if (pressure >= pressureThresholds[i].min && pressure < pressureThresholds[i].max) {
+      return pressureThresholds[i].noteIndex;
+    }
+  }
+  return -1; // 无对应音阶
+}
+
+// 计算当前八度的频率
+function getFrequency(noteIndex) {
+  if (noteIndex < 0 || noteIndex >= notes.length) return 0;
+  
+  let baseFreq = notes[noteIndex].baseFreq;
+  // 根据八度偏移调整频率（每升高一个八度频率翻倍）
+  return baseFreq * Math.pow(2, octaveOffset);
+}
+
+// 获取当前八度的音调名称
+function getNoteName(noteIndex) {
+  if (noteIndex < 0 || noteIndex >= notes.length) return "";
+  
+  let baseName = notes[noteIndex].name;
+  let noteLetter = baseName.slice(0, -1); // 获取音名（C、D等）
+  let baseOctave = parseInt(baseName.slice(-1)); // 获取基础八度
+  let currentOctave = baseOctave + octaveOffset;
+  
+  return noteLetter + currentOctave;
+}
+
+// 播放音调
+function playNote(noteIndex) {
+  if (noteIndex >= 0 && noteIndex < notes.length) {
+    let freq = getFrequency(noteIndex);
+    let name = getNoteName(noteIndex);
+    
+    osc.freq(freq);
+    envelope.play();
+    
+    // 返回音调信息用于显示
+    return { freq: freq, name: name };
+  }
+  return null;
+}
+
+// 处理压力传感器输入
+// 处理压力传感器输入
+function handlePressureInput(pressure) {
+  let currentTime = millis();
+  
+  // 检查是否在冷却时间内
+  if (currentTime - lastNoteTime < noteCooldown) {
+    return false;
+  }
+  
+  let noteIndex = getNoteFromPressure(pressure);
+  if (noteIndex >= 0) {
+    // 修复：将压力值反向映射到形变强度（压力越大形变越小，压力越小形变越大）
+    // 原来的映射：pressure(0-700) -> strength(20-120)
+    // 现在的映射：pressure(0-700) -> strength(120-20)
+    let strength = map(pressure, 0, 700, 120, 20);
+    
+    // 播放音调并应用形变
+    let playedNote = playNote(noteIndex);
+    centerRing.applyDeformationFromInput(strength, noteIndex);
+    
+    // 更新最后触发时间
+    lastNoteTime = currentTime;
+    
+    return true;
+  }
+  
+  return false;
+}
+// Arduino串口通信函数
+function setupSerial() {
+  // 创建串口连接
+  serial = new p5.SerialPort();
+  
+  // 设置串口回调函数
+  serial.on('data', serialData);
+  serial.on('error', serialError);
+  
+  // 打开串口（需要用户授权）
+  serial.open('COM3'); // 根据实际Arduino端口修改
+}
+
+// 串口数据接收函数
+function serialData() {
+  let data = serial.readStringUntil('\r\n');
+  console.log(data)
+  if (data) {
+    // 解析压力传感器值
+    let pressure = parseInt(data.trim());
+    if (!isNaN(pressure)) {
+      pressureValue = pressure;
+      // 处理压力输入
+      handlePressureInput(pressure);
+    }
+  }
+}
+
+// 串口错误处理
+function serialError(err) {
+  console.log('Serial error: ' + err);
+}
+
+class MagneticParticle {
+  constructor() {
+    this.resetPosition();
+    
+    // 物理属性
+    this.velocity = createVector(0, 0);
+    this.acceleration = createVector(0, 0);
+    this.size = random(1.5, 4);
+    
+    // 外观属性
+    this.baseColor = color(200, 220, 255, 200);
+    this.activeColor = color(255, 200, 100, 240);
+    this.currentColor = this.baseColor;
+    
+    // 状态
+    this.isActive = false;
+    this.life = 1.0;
+    this.activationDistance = 250;
+    this.maxSpeed = 4;
+  }
+  
+  resetPosition() {
+    let side = floor(random(4));
+    let edgeOffset = random(10, 50);
+    
+    switch(side) {
+      case 0: // 上边
+        this.position = createVector(random(-50, width + 50), -edgeOffset);
+        break;
+      case 1: // 右边
+        this.position = createVector(width + edgeOffset, random(-50, height + 50));
+        break;
+      case 2: // 下边
+        this.position = createVector(random(-50, width + 50), height + edgeOffset);
+        break;
+      case 3: // 左边
+        this.position = createVector(-edgeOffset, random(-50, height + 50));
+        break;
+    }
+  }
+  
+  update(centerX, centerY, deformationAngle, deformationStrength) {
+    let center = createVector(centerX, centerY);
+    let distance = p5.Vector.dist(this.position, center);
+    
+    if (distance < this.activationDistance && !this.isActive) {
+      this.isActive = true;
+    }
+    
+    if (this.isActive) {
+      let magneticForce = createVector(0, 0);
+      
+      if (deformationStrength > 5) {
+        let forceDirection = deformationAngle + PI;
+        let forceMagnitude = map(deformationStrength, 0, 150, 0.3, 3.0);
+        
+        magneticForce = p5.Vector.fromAngle(forceDirection);
+        magneticForce.mult(forceMagnitude);
+      }
+      
+      let toCenter = p5.Vector.sub(center, this.position);
+      let centerForce = toCenter.normalize();
+      centerForce.mult(map(distance, 0, this.activationDistance, 0.8, 0.2));
+      
+      this.acceleration = p5.Vector.add(magneticForce, centerForce);
+      
+      let randomForce = createVector(random(-0.05, 0.05), random(-0.05, 0.05));
+      this.acceleration.add(randomForce);
+      
+      this.velocity.add(this.acceleration);
+      this.velocity.limit(this.maxSpeed);
+      this.position.add(this.velocity);
+      
+      let speed = this.velocity.mag();
+      let colorLerp = map(speed, 0, this.maxSpeed, 0, 1);
+      this.currentColor = lerpColor(this.baseColor, this.activeColor, colorLerp);
+      
+      if (distance < centerRing.outerR + 15) {
+        this.life -= 0.08;
+        if (this.life <= 0) {
+          this.resetPosition();
+          this.life = 1.0;
+          this.isActive = false;
+          this.velocity.mult(0);
+        }
+      }
+    } else {
+      this.velocity.add(createVector(random(-0.1, 0.1), random(-0.1, 0.1)));
+      this.velocity.limit(0.8);
+      this.position.add(this.velocity);
+      
+      if (this.position.x < -100 || this.position.x > width + 100 || 
+          this.position.y < -100 || this.position.y > height + 100) {
+        this.resetPosition();
+      }
+    }
+    
+    this.acceleration.mult(0);
+  }
+  
+  display() {
+    push();
+    let alpha = this.isActive ? 255 * this.life : 180;
+    fill(red(this.currentColor), green(this.currentColor), blue(this.currentColor), alpha);
+    noStroke();
+    
+    ellipse(this.position.x, this.position.y, this.size, this.size);
+    
+    if (this.isActive && this.velocity.mag() > 0.5) {
+      let trailLength = this.velocity.mag() * 4;
+      let trail = p5.Vector.mult(this.velocity.normalize(), -trailLength);
+      stroke(red(this.currentColor), green(this.currentColor), blue(this.currentColor), alpha * 0.6);
+      strokeWeight(1);
+      line(this.position.x, this.position.y, 
+           this.position.x + trail.x, this.position.y + trail.y);
+    }
+    
+    pop();
+  }
+}
+
+class CenterRing {
+  constructor() {
+    this.x = width / 2;
+    this.y = height / 2;
+    this.baseInnerR = 80;
+    this.baseOuterR = 120;
+    this.innerR = this.baseInnerR;
+    this.outerR = this.baseOuterR;
+    
+    this.baseColor = color(100, 150, 255, 150);
+    this.currentColor = this.baseColor;
+    this.deformationColors = [
+      color(100, 150, 255, 150),
+      color(100, 200, 255, 180),  
+      color(255, 200, 100, 200),
+      color(255, 150, 100, 220),
+      color(255, 80, 80, 240)
+    ];
+    
+    this.segments = 120;
+    this.points = [];
+    this.initPoints();
+    
+    this.deformationStrength = 0;
+    this.targetDeformation = 0;
+    this.smoothness = 0.15;
+    
+    this.inputValue = 0;
+    this.lastDeformationAngle = 0;
+    this.deformationHistory = [];
+    
+    this.maxDeformation = 150;
+    this.maxPointOffset = 80;
+    
+    // 音调相关
+    this.currentNote = null;
+    this.noteDisplayTime = 0;
+  }
+
+  initPoints() {
+    this.points = [];
+    for (let i = 0; i < this.segments; i++) {
+      let angle = map(i, 0, this.segments, 0, TWO_PI);
+      this.points.push({
+        angle: angle,
+        offset: 0,
+        velocity: 0,
+        elasticity: random(0.88, 0.95),
+        mass: random(0.8, 1.2)
+      });
+    }
+  }
+
+  update() {
+    this.applySmoothDeformation();
+    this.updatePointsPhysics();
+    this.updateColor();
+    
+    // 更新音调显示时间
+    if (this.noteDisplayTime > 0) {
+      this.noteDisplayTime--;
+    }
+    
+    for (let particle of magneticParticles) {
+      particle.update(this.x, this.y, this.lastDeformationAngle, this.targetDeformation);
+    }
+  }
+
+  updateColor() {
+    let deformationRatio = this.targetDeformation / this.maxDeformation;
+    
+    if (deformationRatio < 0.2) {
+      this.currentColor = this.deformationColors[0];
+    } else if (deformationRatio < 0.4) {
+      this.currentColor = this.deformationColors[1];
+    } else if (deformationRatio < 0.6) {
+      this.currentColor = this.deformationColors[2];
+    } else if (deformationRatio < 0.8) {
+      this.currentColor = this.deformationColors[3];
+    } else {
+      this.currentColor = this.deformationColors[4];
+    }
+  }
+
+  applyDeformationFromInput(value, noteIndex = -1) {
+    if (value > 0) {
+      this.inputValue = value;
+      
+      let randomAngle = random(TWO_PI);
+      this.lastDeformationAngle = randomAngle;
+      
+      let strength = constrain(value, 10, this.maxDeformation);
+      this.targetDeformation = strength;
+      
+      // 记录音调信息
+      if (noteIndex >= 0) {
+        this.currentNote = {
+          name: getNoteName(noteIndex),
+          freq: getFrequency(noteIndex)
+        };
+        this.noteDisplayTime = 60; // 显示1秒（60帧）
+      }
+      
+      this.deformationHistory.push({
+        angle: randomAngle,
+        strength: strength,
+        timestamp: millis(),
+        note: this.currentNote
+      });
+      
+      if (this.deformationHistory.length > 5) {
+        this.deformationHistory.shift();
+      }
+      
+      this.applyDirectionalDeformation(randomAngle, strength);
+    }
+  }
+
+  applyDirectionalDeformation(deformationAngle, strength) {
+    for (let p of this.points) {
+      let angleDiffVal = angleDiff(p.angle, deformationAngle);
+      let absAngleDiff = abs(angleDiffVal);
+      
+      let influence = 0;
+      
+      // 修复：形变应该向外推，而不是向内收缩
+      if (absAngleDiff < PI * 0.8) {
+        // 在形变方向区域，向外推
+        influence = cos(map(absAngleDiff, 0, PI * 0.8, 0, PI/2)) * strength * 1.2;
+      } else {
+        // 在相反方向区域，轻微向内拉
+        influence = -sin(map(absAngleDiff, PI * 0.8, PI, 0, PI/2)) * strength * 0.2;
+      }
+      
+      let force = influence / p.mass;
+      p.velocity += force * 0.15;
+    }
+  }
+
+  applySmoothDeformation() {
+    // 修复：形变强度应该逐渐衰减，而不是影响半径
+    if (this.targetDeformation > 0.1) {
+      this.targetDeformation *= 0.92;
+    } else {
+      this.targetDeformation = 0;
+    }
+    
+    // 修复：移除对半径的影响，让形变只通过点的偏移来表现
+    this.outerR = this.baseOuterR;
+    this.innerR = this.baseInnerR;
+  }
+
+  updatePointsPhysics() {
+    for (let p of this.points) {
+      let restorationForce = -p.offset * 0.08;
+      p.velocity += restorationForce;
+      p.velocity *= p.elasticity;
+      p.offset += p.velocity;
+      p.offset = constrain(p.offset, -this.maxPointOffset, this.maxPointOffset);
+      
+      if (abs(p.offset) < 0.1 && abs(p.velocity) < 0.05) {
+        p.offset = 0;
+        p.velocity = 0;
+      }
+    }
+  }
+
+  display() {
+    push();
+    translate(this.x, this.y);
+    noFill();
+    
+    let strokeW = this.outerR - this.innerR;
+    strokeWeight(strokeW);
+    
+    let deformationRatio = this.targetDeformation / this.maxDeformation;
+    stroke(this.currentColor);
+    
+    // 绘制外环（带形变）
+    beginShape();
+    for (let p of this.points) {
+      let r = this.outerR + p.offset; // 形变通过点的偏移实现
+      let x = cos(p.angle) * r;
+      let y = sin(p.angle) * r;
+      vertex(x, y);
+    }
+    endShape(CLOSE);
+    
+    // 绘制内环（带轻微形变）
+    strokeWeight(2);
+    let innerAlpha = map(deformationRatio, 0, 1, 120, 200);
+    stroke(255, 255, 255, innerAlpha);
+    beginShape();
+    for (let p of this.points) {
+      let r = this.innerR + p.offset * 0.4; // 内环形变较小
+      let x = cos(p.angle) * r;
+      let y = sin(p.angle) * r;
+      vertex(x, y);
+    }
+    endShape(CLOSE);
+    
+    this.drawDeformationIndicator();
+    this.drawEnergyAura(deformationRatio);
+    
+    // 显示当前音调
+    if (this.noteDisplayTime > 0 && this.currentNote) {
+      this.drawNoteDisplay();
+    }
+    
+    // 显示当前八度
+    this.drawOctaveIndicator();
+    
+    pop();
+  }
+  
+  // 其他方法保持不变...
+  drawNoteDisplay() {
+    push();
+    fill(255, 255, 255, 200);
+    noStroke();
+    textSize(24);
+    textAlign(CENTER, CENTER);
+    text(this.currentNote.name, 0, -this.outerR - 40);
+    
+    // 绘制音调指示器
+    fill(255, 200, 100, 150);
+    ellipse(0, -this.outerR - 20, 30, 30);
+    
+    // 绘制音波效果
+    stroke(255, 200, 100, 100);
+    strokeWeight(2);
+    noFill();
+    for (let i = 0; i < 3; i++) {
+      let waveSize = 40 + i * 15 + sin(frameCount * 0.2) * 5;
+      ellipse(0, -this.outerR - 20, waveSize, waveSize);
+    }
+    pop();
+  }
+  
+  drawOctaveIndicator() {
+    push();
+    fill(255, 255, 255, 180);
+    noStroke();
+    textSize(16);
+    textAlign(CENTER, CENTER);
+    
+    let octaveText = "";
+    if (octaveOffset === -1) {
+      octaveText = "低八度 (C3-D4)";
+      fill(100, 200, 255); // 蓝色表示低八度
+    } else if (octaveOffset === 0) {
+      octaveText = "正常八度 (C4-D5)";
+      fill(255, 255, 255); // 白色表示正常
+    } else if (octaveOffset === 1) {
+      octaveText = "高八度 (C5-D6)";
+      fill(255, 200, 100); // 黄色表示高八度
+    }
+    
+    text(octaveText, 0, this.outerR + 40);
+    pop();
+  }
+  
+  drawEnergyAura(deformationRatio) {
+    if (deformationRatio > 0.1) {
+      let auraSize = this.outerR + 30 + deformationRatio * 50;
+      let auraAlpha = deformationRatio * 150;
+      
+      noFill();
+      stroke(red(this.currentColor), green(this.currentColor), blue(this.currentColor), auraAlpha);
+      strokeWeight(2 + deformationRatio * 3);
+      ellipse(0, 0, auraSize * 2, auraSize * 2);
+    }
+  }
+  
+  drawDeformationIndicator() {
+    if (this.targetDeformation > 1) {
+      push();
+      let indicatorAlpha = map(this.targetDeformation, 0, this.maxDeformation, 100, 255);
+      stroke(255, 255, 100, indicatorAlpha);
+      strokeWeight(2 + this.targetDeformation / 30);
+      let indicatorLength = this.outerR + 30 + this.targetDeformation * 0.5;
+      line(0, 0, cos(this.lastDeformationAngle) * indicatorLength, sin(this.lastDeformationAngle) * indicatorLength);
+      
+      fill(255, 255, 100, indicatorAlpha);
+      noStroke();
+      let arrowSize = 8 + this.targetDeformation / 20;
+      let arrowX = cos(this.lastDeformationAngle) * indicatorLength;
+      let arrowY = sin(this.lastDeformationAngle) * indicatorLength;
+      this.drawArrow(arrowX, arrowY, this.lastDeformationAngle, arrowSize);
+      
+      pop();
+    }
+  }
+  
+  drawArrow(x, y, angle, size) {
+    push();
+    translate(x, y);
+    rotate(angle);
+    
+    beginShape();
+    vertex(size, 0);
+    vertex(-size * 0.5, size * 0.5);
+    vertex(-size * 0.5, -size * 0.5);
+    endShape(CLOSE);
+    
+    pop();
+  }
+}
+
+function setup() {
+  createCanvas(800, 600);
+  centerRing = new CenterRing();
+  
+  // 初始化声音系统
+  initSounds();
+  
+  // 初始化压力传感器阈值
+  initPressureThresholds();
+  
+  // 初始化串口通信（取消注释以启用Arduino连接）
+  setupSerial();
+  
+  // 创建粒子
+  for (let i = 0; i < 600; i++) {
+    magneticParticles.push(new MagneticParticle());
+  }
+}
+
+function draw() {
+  background(20, 25, 40);
+  
+  drawGrid();
+  
+  for (let particle of magneticParticles) {
+    particle.display();
+  }
+  
+  centerRing.update();
+  centerRing.display();
+  
+  drawInstructions();
+  
+  // 绘制压力传感器信息
+  drawPressureInfo();
+}
+
+function drawGrid() {
+  stroke(255, 8);
+  strokeWeight(1);
+  
+  for (let x = 0; x < width; x += 50) {
+    line(x, 0, x, height);
+  }
+  for (let y = 0; y < height; y += 50) {
+    line(0, y, width, y);
+  }
+  
+  stroke(255, 20);
+  line(width/2, 0, width/2, height);
+  line(0, height/2, width, height/2);
+}
+
+function drawInstructions() {
+  fill(255);
+  noStroke();
+  textSize(14);
+  textAlign(LEFT, TOP);
+  
+  text("音乐磁力乐器 - 多输入模式", 20, 20);
+  text("数字键 1-9: 不同音调 + 形变", 20, 40);
+  text("1-9 + M: 低八度 (C3-D4)", 20, 60);
+  text("1-9 + N: 高八度 (C5-D6)", 20, 80);
+  text("空格键: 重置", 20, 100);
+  
+  text("音阶对应:", 20, 130);
+  text("1:C 2:D 3:E 4:F 5:G 6:A 7:B 8:C 9:D", 20, 150);
+  
+  text("磁力效果:", 20, 180);
+  text("• 粒子被吸引向形变方向", 20, 200);
+  text("• 形变越强，磁力越大", 20, 220);
+  text("• 每个音调对应不同强度", 20, 240);
+  
+  let currentStrength = centerRing.targetDeformation.toFixed(1);
+  let maxStrength = centerRing.maxDeformation;
+  let deformationPercent = ((centerRing.targetDeformation / maxStrength) * 100).toFixed(1);
+  
+  text("当前形变强度: " + currentStrength + " (" + deformationPercent + "%)", 20, 270);
+  
+  let activeParticles = magneticParticles.filter(p => p.isActive).length;
+  text("活跃粒子: " + activeParticles + "/" + magneticParticles.length, 20, 295);
+  
+  // 显示当前八度状态
+  let octaveStatus = "";
+  if (octaveOffset === -1) {
+    octaveStatus = "低八度 (C3-D4)";
+  } else if (octaveOffset === 0) {
+    octaveStatus = "正常八度 (C4-D5)";
+  } else if (octaveOffset === 1) {
+    octaveStatus = "高八度 (C5-D6)";
+  }
+  text("当前八度: " + octaveStatus, 20, 320);
+  
+  // 显示音调说明
+  if (centerRing.currentNote && centerRing.noteDisplayTime > 0) {
+    fill(255, 200, 100, 200);
+    text("当前音调: " + centerRing.currentNote.name + " (" + centerRing.currentNote.freq.toFixed(2) + "Hz)", 20, 345);
+  }
+}
+
+function drawPressureInfo() {
+  fill(255);
+  noStroke();
+  textSize(14);
+  textAlign(RIGHT, TOP);
+  
+  text("压力传感器输入", width - 20, 20);
+  text("当前压力值: " + pressureValue, width - 20, 40);
+  
+  // 绘制冷却时间指示器
+  let currentTime = millis();
+  let timeSinceLastNote = currentTime - lastNoteTime;
+  let cooldownProgress = min(timeSinceLastNote / noteCooldown, 1);
+  
+  // 绘制冷却条
+  let barWidth = 200;
+  let barHeight = 10;
+  let barX = width - barWidth - 20;
+  let barY = 70;
+  
+  fill(100, 100, 100, 150);
+  rect(barX, barY, barWidth, barHeight);
+  
+  if (cooldownProgress < 1) {
+    fill(255, 100, 100, 200);
+    rect(barX, barY, barWidth * cooldownProgress, barHeight);
+    fill(255);
+    text("冷却中... " + (noteCooldown - timeSinceLastNote).toFixed(0) + "ms", width - 20, 85);
+  } else {
+    fill(100, 255, 100, 200);
+    rect(barX, barY, barWidth, barHeight);
+    fill(255);
+    text("就绪", width - 20, 85);
+  }
+  
+  // 绘制压力分层信息
+  textAlign(RIGHT, TOP);
+  text("压力分层 (0-700):", width - 20, 110);
+  
+  for (let i = 0; i < pressureThresholds.length; i++) {
+  let threshold = pressureThresholds[i];
+  // 修复：使用正确的音阶索引来获取音调名称
+  let noteName = getNoteName(threshold.noteIndex); // 使用threshold.noteIndex而不是i
+  let yPos = 130 + i * 20;
+
+  // 高亮当前所在的压力区间
+  if (pressureValue >= threshold.min && pressureValue < threshold.max) {
+    fill(255, 200, 100);
+  } else {
+    fill(200);
+  }
+
+  text(noteName + ": " + threshold.min.toFixed(0) + "-" + threshold.max.toFixed(0), width - 20, yPos);
+}}
+
+function keyPressed() {
+  // 处理修饰键
+  if (key === 'm' || key === 'M') {
+    modifierKeys.m = true;
+    octaveOffset = -1;
+    return;
+  }
+  
+  if (key === 'n' || key === 'N') {
+    modifierKeys.n = true;
+    octaveOffset = 1;
+    return;
+  }
+  
+  // 数字键 1-9 触发音调和形变
+  if (key >= '1' && key <= '9') {
+    let noteIndex = int(key) - 1; // 转换为0-8的索引
+    let value = map(noteIndex, 0, 8, 15, 100);
+    
+    // 播放音调
+    let playedNote = playNote(noteIndex);
+    
+    // 应用形变
+    centerRing.applyDeformationFromInput(value, noteIndex);
+    
+    // 更新最后触发时间
+    lastNoteTime = millis();
+  }
+  
+  if (key === ' ') {
+    centerRing.initPoints();
+    centerRing.targetDeformation = 0;
+    centerRing.inputValue = 0;
+    centerRing.deformationHistory = [];
+    centerRing.currentColor = centerRing.baseColor;
+    centerRing.currentNote = null;
+    
+    // 重置八度
+    octaveOffset = 0;
+    modifierKeys.m = false;
+    modifierKeys.n = false;
+    
+    // 重置压力传感器相关
+    pressureValue = 0;
+    lastNoteTime = 0;
+    
+    for (let particle of magneticParticles) {
+      particle.resetPosition();
+      particle.isActive = false;
+      particle.life = 1.0;
+      particle.velocity.mult(0);
+    }
+  }
+
+  
+}
+
+function keyReleased() {
+  // 释放修饰键时重置八度
+  if (key === 'm' || key === 'M') {
+    modifierKeys.m = false;
+    if (!modifierKeys.n) {
+      octaveOffset = 0;
+    }
+  }
+  
+  if (key === 'n' || key === 'N') {
+    modifierKeys.n = false;
+    if (!modifierKeys.m) {
+      octaveOffset = 0;
+    }
+  }
+}
